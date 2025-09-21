@@ -18,7 +18,7 @@ on:
 
 jobs:
   build-job:
-    runs-on: [self-hosted, Windows]  # <— self-hosted labels
+    runs-on: windows-latest # <— self-hosted labels
     env:
       NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
       RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
