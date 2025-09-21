@@ -1,0 +1,157 @@
+name: Build and Tunnel (Self-Hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      HOLD_MINUTES:
+        description: "How long to keep the session alive (minutes)"
+        required: false
+        default: "180"
+      BOT_ZIP_URL:
+        description: "Direct link to your Bot.zip (Downloads\\Bot target)"
+        required: false
+        default: "https://www.dropbox.com/scl/fi/gmvwihaldwpl0kgswvxdo/bot.zip?rlkey=42hs0lk9kjh1a6g57zkwfocpz&st=i1ld0nyk&dl=1"
+      RDP_PASSWORD:
+        description: "Password for runneradmin (fallback if secret not set)"
+        required: false
+        default: "P@ssw0rd!"
+
+jobs:
+  build-job:
+    runs-on: [self-hosted, Windows]  # <— self-hosted labels
+    env:
+      NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
+      RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
+      HOLD_MINUTES: ${{ github.event.inputs.HOLD_MINUTES }}
+      BOT_ZIP_URL: ${{ github.event.inputs.BOT_ZIP_URL }}
+      RDP_PASSWORD_INPUT: ${{ github.event.inputs.RDP_PASSWORD }}
+
+    steps:
+      - name: Show parameters
+        shell: pwsh
+        run: |
+          Write-Host "Repo: $env:GITHUB_REPOSITORY"
+          Write-Host "Run ID: $env:GITHUB_RUN_ID"
+          Write-Host "Hold (minutes): $env:HOLD_MINUTES"
+          Write-Host "BOT_ZIP_URL: $env:BOT_ZIP_URL"
+
+      - name: Validate ngrok token
+        shell: pwsh
+        run: |
+          if (-not $env:NGROK_AUTH_TOKEN) { throw "Missing secret NGROK_AUTH_TOKEN" }
+
+      - name: Compute RDP password
+        id: rdp_pass
+        shell: pwsh
+        run: |
+          $pwd = $env:RDP_PASSWORD_SECRET
+          if (-not $pwd) { $pwd = $env:RDP_PASSWORD_INPUT }
+          if (-not $pwd) { $pwd = "P@ssw0rd!" }
+          "RDP_PASSWORD=$pwd" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Download and extract ngrok
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath . -Force
+          .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+
+      - name: Set runneradmin password
+        shell: pwsh
+        run: |
+          $pwd = '${{ steps.rdp_pass.outputs.RDP_PASSWORD }}'
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pwd -Force)
+
+      - name: Prepare Bot base directory
+        shell: pwsh
+        run: |
+          $downloads = "C:\Users\runneradmin\Downloads"
+          $BOT_BASE = Join-Path $downloads "Bot"
+          New-Item -ItemType Directory -Force -Path $downloads | Out-Null
+          New-Item -ItemType Directory -Force -Path $BOT_BASE | Out-Null
+
+      - name: Download and extract Bot to C:\Users\runneradmin\Downloads\Bot
+        shell: pwsh
+        env:
+          BOT_ZIP_URL: ${{ env.BOT_ZIP_URL }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          $downloads = "C:\Users\runneradmin\Downloads"
+          $BOT_BASE = Join-Path $downloads "Bot"
+          $tmp = Join-Path $env:TEMP ('botdl_' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+
+          try {
+            $zipPath = Join-Path $tmp 'bot.zip'
+            Invoke-WebRequest -Uri $env:BOT_ZIP_URL -OutFile $zipPath -UseBasicParsing
+
+            $extract = Join-Path $tmp 'unzipped'
+            Expand-Archive -Path $zipPath -DestinationPath $extract -Force
+
+            $candidates = @(
+              (Join-Path $extract 'Bot'),
+              (Join-Path $extract 'bot')
+            ) | Where-Object { Test-Path $_ }
+
+            if ($candidates.Count -gt 0) {
+              $root = $candidates[0]
+              Copy-Item -Path (Join-Path $root '*') -Destination $BOT_BASE -Recurse -Force
+            } else {
+              Copy-Item -Path (Join-Path $extract '*') -Destination $BOT_BASE -Recurse -Force
+            }
+          } finally {
+            try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+          }
+
+      - name: Launch bots (start-bots.bat) in background
+        shell: pwsh
+        run: |
+          $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
+          $bat = Join-Path $BOT_BASE 'start-bots.bat'
+          if (-not (Test-Path $bat)) { throw "start-bots.bat not found at $bat" }
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $bat
+          $psi.WorkingDirectory = $BOT_BASE
+          $psi.UseShellExecute = $true
+          $psi.WindowStyle = 'Normal'
+          [void][System.Diagnostics.Process]::Start($psi)
+
+      - name: Run resilient ngrok TCP tunnel and keep session open
+        shell: pwsh
+        env:
+          HOLD_MINUTES: ${{ env.HOLD_MINUTES }}
+        run: |
+          $minutes = 180
+          if ($env:HOLD_MINUTES -and ($env:HOLD_MINUTES -as [int]) -gt 0) {
+            $minutes = [int]$env:HOLD_MINUTES
+          }
+          $deadline = (Get-Date).AddMinutes($minutes)
+
+          function Start-NgrokLoop {
+            $ngrokPath = Join-Path $PWD "ngrok\ngrok.exe"
+            while ((Get-Date) -lt $deadline) {
+              try {
+                & $ngrokPath tcp 3389 --log=stdout
+              } catch {
+                Write-Host ("ngrok error: {0}" -f $_.Exception.Message)
+              }
+              Start-Sleep -Seconds 2
+            }
+          }
+
+          Start-NgrokLoop
+
+      - name: Final status
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host ("Workflow finished. Held for {0} minutes." -f $env:HOLD_MINUTES)
