@@ -109,6 +109,67 @@ jobs:
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pwd -Force)
           Write-Host "runneradmin password set."
 
+      - name: Install Google Chrome (winget with Chocolatey fallback)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          function Test-Chrome { Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe" -or Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
+
+          if (-not (Test-Chrome)) {
+            Write-Host "Trying winget to install Google Chrome..."
+            try {
+              winget install Google.Chrome --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
+            } catch {
+              Write-Host "winget failed or not available. Trying Chocolatey..."
+              choco install googlechrome -y --no-progress
+            }
+          } else {
+            Write-Host "Chrome already present."
+          }
+
+          # Verify installation
+          if (-not (Test-Chrome)) { throw "Google Chrome installation failed." }
+          Write-Host "Google Chrome is installed."
+
+      - name: Initialize Chrome profile (Default) and suppress first-run
+        shell: pwsh
+        run: |
+          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chrome)) { $chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
+          if (-not (Test-Path $chrome)) { throw "chrome.exe not found after install" }
+
+          # Create policies to suppress first-run prompts and default browser checks
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "SuppressFirstRunDefaultBrowserPrompt" -PropertyType DWord -Value 1 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "DefaultBrowserSettingEnabled" -PropertyType DWord -Value 0 -Force | Out-Null
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "BrowserSignin" -PropertyType DWord -Value 0 -Force | Out-Null
+
+          # Pre-create user data and Default profile
+          $userData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+          $defaultProfile = Join-Path $userData "Default"
+          New-Item -ItemType Directory -Force -Path $defaultProfile | Out-Null
+
+          # Launch Chrome headless once to materialize the profile and then close
+          $args = @(
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--user-data-dir=""$userData""",
+            "--profile-directory=""Default""",
+            "--disable-features=NetworkService,TranslateUI"
+          ) -join " "
+
+          Write-Host "Priming Chrome profile at $defaultProfile"
+          Start-Process -FilePath $chrome -ArgumentList $args
+          Start-Sleep -Seconds 6
+          Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          if (-not (Test-Path (Join-Path $defaultProfile "Preferences"))) {
+            Write-Host "Preferences file not yet present; this is OK, profile folder exists."
+          }
+          Write-Host "Chrome profile initialized."
+
       - name: Prepare Bot base directory
         shell: pwsh
         run: |
@@ -148,7 +209,7 @@ jobs:
           try {
             $zipPath = Join-Path $tmp 'bot.zip'
             if ([string]::IsNullOrWhiteSpace($env:EFFECTIVE_BOT_URL)) {
-              throw "Effective bot URL is empty. Check inputs/secrets."
+              throw "Effective bot URL is empty. Provide BOT_ZIP_URL input or secret."
             }
             Invoke-WithRetry -url $env:EFFECTIVE_BOT_URL -outFile $zipPath
 
@@ -168,11 +229,6 @@ jobs:
               Write-Host "No root 'Bot' folder; copying all extracted files into BOT_BASE"
               Copy-Item -Path (Join-Path $extract '*') -Destination $BOT_BASE -Recurse -Force
             }
-
-            Write-Host "Downloads directory listing:"
-            Get-ChildItem -Force $downloads | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
-            Write-Host "Bot directory listing:"
-            Get-ChildItem -Force $BOT_BASE | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
           }
           finally {
             try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
