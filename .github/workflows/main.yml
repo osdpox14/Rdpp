@@ -13,11 +13,11 @@ on:
       BOT_ZIP_URL:
         description: "Direct link to your Bot.zip (Downloads\\Bot target)"
         required: false
-        default: "https://www.dropbox.com/scl/fi/gmvwihaldwpl0kgswvxdo/bot.zip?rlkey=42hs0lk9kjh1a6g57zkwfocpz&st=i1ld0nyk&dl=1"
+        default: ""
       RDP_PASSWORD:
         description: "Password for runneradmin if not provided via secret"
         required: false
-        default: "P@ssw0rd!"
+        default: ""
 
 jobs:
   build-job:
@@ -27,59 +27,71 @@ jobs:
       # Secrets
       NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
       RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
+      BOT_ZIP_URL_SECRET: ${{ secrets.BOT_ZIP_URL }} # optional secret override
 
-      # Inputs (available both on push and workflow_dispatch)
-      HOLD_MINUTES: ${{ github.event.inputs.HOLD_MINUTES }}
-      BOT_ZIP_URL: ${{ github.event.inputs.BOT_ZIP_URL }}
+      # Raw inputs (may be empty)
+      HOLD_MINUTES_INPUT: ${{ github.event.inputs.HOLD_MINUTES }}
+      BOT_ZIP_URL_INPUT: ${{ github.event.inputs.BOT_ZIP_URL }}
       RDP_PASSWORD_INPUT: ${{ github.event.inputs.RDP_PASSWORD }}
 
+      # Hard default for bot zip (used only if neither secret nor input is set)
+      BOT_ZIP_URL_DEFAULT: "https://www.dropbox.com/scl/fi/gmvwihaldwpl0kgswvxdo/bot.zip?rlkey=42hs0lk9kjh1a6g57zkwfocpz&st=i1ld0nyk&dl=1"
+
     steps:
-      - name: Show parameters
+      - name: Show runner info
         shell: pwsh
         run: |
-          Write-Host "==============================================="
-          Write-Host "Repo            : $env:GITHUB_REPOSITORY"
-          Write-Host "Run ID          : $env:GITHUB_RUN_ID"
-          Write-Host "Hold (minutes)  : $env:HOLD_MINUTES"
-          Write-Host "BOT_ZIP_URL     : $env:BOT_ZIP_URL"
-          Write-Host "==============================================="
+          Write-Host "Runner name        : $env:RUNNER_NAME"
+          Write-Host "Runner OS          : $env:RUNNER_OS"
+          Write-Host "Workspace          : $env:GITHUB_WORKSPACE"
 
       - name: Validate ngrok token
         shell: pwsh
         run: |
-          if (-not $env:NGROK_AUTH_TOKEN) {
-            Write-Error "Missing secret NGROK_AUTH_TOKEN"
-            exit 1
-          }
+          if (-not $env:NGROK_AUTH_TOKEN) { throw "Missing secret NGROK_AUTH_TOKEN" }
           Write-Host "NGROK_AUTH_TOKEN is present."
 
-      - name: Compute RDP password (secret > input > default)
-        id: rdp_pass
+      - name: Resolve inputs/defaults
+        id: resolve
         shell: pwsh
         run: |
-          $pwd = $env:RDP_PASSWORD_SECRET
-          if ([string]::IsNullOrWhiteSpace($pwd)) { $pwd = $env:RDP_PASSWORD_INPUT }
-          if ([string]::IsNullOrWhiteSpace($pwd)) { $pwd = "P@ssw0rd!" }
-          "RDP_PASSWORD=$pwd" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # Hold minutes
+          $hold = $env:HOLD_MINUTES_INPUT
+          if ([string]::IsNullOrWhiteSpace($hold)) { $hold = "180" }
+          if (-not ($hold -as [int])) { $hold = "180" }
+
+          # RDP password: secret > input > default
+          $rdp = $env:RDP_PASSWORD_SECRET
+          if ([string]::IsNullOrWhiteSpace($rdp)) { $rdp = $env:RDP_PASSWORD_INPUT }
+          if ([string]::IsNullOrWhiteSpace($rdp)) { $rdp = "P@ssw0rd!" }
+
+          # Bot URL: secret > input > hard default
+          $botUrl = $env:BOT_ZIP_URL_SECRET
+          if ([string]::IsNullOrWhiteSpace($botUrl)) { $botUrl = $env:BOT_ZIP_URL_INPUT }
+          if ([string]::IsNullOrWhiteSpace($botUrl)) { $botUrl = $env:BOT_ZIP_URL_DEFAULT }
+
+          Write-Host "Effective Hold (min): $hold"
+          Write-Host "Effective Bot URL   : $botUrl"
+
+          "EffectiveHoldMinutes=$hold" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "EffectiveRdpPassword=$rdp" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "EffectiveBotUrl=$botUrl"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Download and extract ngrok (robust)
         shell: pwsh
         run: |
           Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
-          # Try extracting to current folder
           Expand-Archive ngrok.zip -DestinationPath . -Force
           $ng = Join-Path $PWD "ngrok\ngrok.exe"
           if (-not (Test-Path $ng)) { $ng = Join-Path $PWD "ngrok.exe" }
           if (-not (Test-Path $ng)) {
-            # Fallback: extract into .\ngrok\ explicitly
             if (Test-Path ".\ngrok") { Remove-Item -Recurse -Force ".\ngrok" }
             New-Item -ItemType Directory -Path ".\ngrok" | Out-Null
             Expand-Archive ngrok.zip -DestinationPath ".\ngrok" -Force
             $ng = Join-Path $PWD "ngrok\ngrok.exe"
           }
           if (-not (Test-Path $ng)) { throw "ngrok.exe not found after extract" }
-          Write-Host "ngrok at: $ng"
-          # Authenticate
+          Write-Host "ngrok path: $ng"
           & $ng authtoken $Env:NGROK_AUTH_TOKEN
 
       - name: Enable Remote Desktop
@@ -88,12 +100,12 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-          Write-Host "RDP enabled and firewall rule applied."
+          Write-Host "RDP enabled and firewall updated."
 
       - name: Set runneradmin password
         shell: pwsh
         run: |
-          $pwd = '${{ steps.rdp_pass.outputs.RDP_PASSWORD }}'
+          $pwd = '${{ steps.resolve.outputs.EffectiveRdpPassword }}'
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pwd -Force)
           Write-Host "runneradmin password set."
 
@@ -109,7 +121,7 @@ jobs:
       - name: Download and extract Bot to C:\Users\runneradmin\Downloads\Bot
         shell: pwsh
         env:
-          BOT_ZIP_URL: ${{ env.BOT_ZIP_URL }}
+          EFFECTIVE_BOT_URL: ${{ steps.resolve.outputs.EffectiveBotUrl }}
         run: |
           $ErrorActionPreference = 'Stop'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -119,10 +131,26 @@ jobs:
           $tmp = Join-Path $env:TEMP ('botdl_' + [guid]::NewGuid())
           New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
+          function Invoke-WithRetry([string]$url, [string]$outFile, [int]$retries = 3, [int]$delay = 5) {
+            for ($i = 1; $i -le $retries; $i++) {
+              try {
+                Write-Host ("Downloading (attempt {0}/{1}) from {2}" -f $i, $retries, $url)
+                Invoke-WebRequest -Uri $url -OutFile $outFile -UseBasicParsing -TimeoutSec 120
+                return
+              } catch {
+                Write-Host ("Download failed: {0}" -f $_.Exception.Message)
+                if ($i -lt $retries) { Start-Sleep -Seconds $delay }
+              }
+            }
+            throw "Failed to download after $retries attempts: $url"
+          }
+
           try {
             $zipPath = Join-Path $tmp 'bot.zip'
-            Write-Host ("Downloading Bot.zip from {0} ..." -f $env:BOT_ZIP_URL)
-            Invoke-WebRequest -Uri $env:BOT_ZIP_URL -OutFile $zipPath -UseBasicParsing
+            if ([string]::IsNullOrWhiteSpace($env:EFFECTIVE_BOT_URL)) {
+              throw "Effective bot URL is empty. Check inputs/secrets."
+            }
+            Invoke-WithRetry -url $env:EFFECTIVE_BOT_URL -outFile $zipPath
 
             $extract = Join-Path $tmp 'unzipped'
             Expand-Archive -Path $zipPath -DestinationPath $extract -Force
@@ -155,10 +183,7 @@ jobs:
         run: |
           $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
           $bat = Join-Path $BOT_BASE 'start-bots.bat'
-          if (-not (Test-Path $bat)) {
-            Write-Error ("start-bots.bat not found at {0}" -f $bat)
-            exit 1
-          }
+          if (-not (Test-Path $bat)) { throw "start-bots.bat not found at $bat" }
           Write-Host "Launching bots via start-bots.bat in background ..."
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = $bat
@@ -170,18 +195,16 @@ jobs:
       - name: Run resilient ngrok TCP tunnel and keep session open
         shell: pwsh
         env:
-          HOLD_MINUTES: ${{ env.HOLD_MINUTES }}
+          HOLD_MINUTES: ${{ steps.resolve.outputs.EffectiveHoldMinutes }}
         run: |
-          # Resolve ngrok path (supports both .\ngrok.exe and .\ngrok\ngrok.exe)
+          # Resolve ngrok path
           $ngrok = Join-Path $PWD "ngrok\ngrok.exe"
           if (-not (Test-Path $ngrok)) { $ngrok = Join-Path $PWD "ngrok.exe" }
           if (-not (Test-Path $ngrok)) { throw "ngrok.exe not found" }
 
           # Determine hold duration
           $minutes = 180
-          if ($env:HOLD_MINUTES -and ($env:HOLD_MINUTES -as [int]) -gt 0) {
-            $minutes = [int]$env:HOLD_MINUTES
-          }
+          if ($env:HOLD_MINUTES -and ($env:HOLD_MINUTES -as [int]) -gt 0) { $minutes = [int]$env:HOLD_MINUTES }
           $deadline = (Get-Date).AddMinutes($minutes)
 
           Write-Host "Starting resilient ngrok loop for ~ $minutes minutes."
@@ -204,4 +227,4 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Write-Host ("Workflow finished. Held for {0} minutes." -f $env:HOLD_MINUTES)
+          Write-Host ("Workflow finished. Held for {0} minutes." -f '${{ steps.resolve.outputs.EffectiveHoldMinutes }}')
