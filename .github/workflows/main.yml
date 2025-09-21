@@ -1,6 +1,9 @@
-name: Build and Tunnel (Self-Hosted)
+name: Build and Tunnel
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       HOLD_MINUTES:
@@ -12,16 +15,20 @@ on:
         required: false
         default: "https://www.dropbox.com/scl/fi/gmvwihaldwpl0kgswvxdo/bot.zip?rlkey=42hs0lk9kjh1a6g57zkwfocpz&st=i1ld0nyk&dl=1"
       RDP_PASSWORD:
-        description: "Password for runneradmin (fallback if secret not set)"
+        description: "Password for runneradmin if not provided via secret"
         required: false
         default: "P@ssw0rd!"
 
 jobs:
   build-job:
-    runs-on: windows-latest # <— self-hosted labels
+    runs-on: windows-latest
+
     env:
+      # Secrets
       NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
       RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
+
+      # Inputs (available both on push and workflow_dispatch)
       HOLD_MINUTES: ${{ github.event.inputs.HOLD_MINUTES }}
       BOT_ZIP_URL: ${{ github.event.inputs.BOT_ZIP_URL }}
       RDP_PASSWORD_INPUT: ${{ github.event.inputs.RDP_PASSWORD }}
@@ -30,31 +37,50 @@ jobs:
       - name: Show parameters
         shell: pwsh
         run: |
-          Write-Host "Repo: $env:GITHUB_REPOSITORY"
-          Write-Host "Run ID: $env:GITHUB_RUN_ID"
-          Write-Host "Hold (minutes): $env:HOLD_MINUTES"
-          Write-Host "BOT_ZIP_URL: $env:BOT_ZIP_URL"
+          Write-Host "==============================================="
+          Write-Host "Repo            : $env:GITHUB_REPOSITORY"
+          Write-Host "Run ID          : $env:GITHUB_RUN_ID"
+          Write-Host "Hold (minutes)  : $env:HOLD_MINUTES"
+          Write-Host "BOT_ZIP_URL     : $env:BOT_ZIP_URL"
+          Write-Host "==============================================="
 
       - name: Validate ngrok token
         shell: pwsh
         run: |
-          if (-not $env:NGROK_AUTH_TOKEN) { throw "Missing secret NGROK_AUTH_TOKEN" }
+          if (-not $env:NGROK_AUTH_TOKEN) {
+            Write-Error "Missing secret NGROK_AUTH_TOKEN"
+            exit 1
+          }
+          Write-Host "NGROK_AUTH_TOKEN is present."
 
-      - name: Compute RDP password
+      - name: Compute RDP password (secret > input > default)
         id: rdp_pass
         shell: pwsh
         run: |
           $pwd = $env:RDP_PASSWORD_SECRET
-          if (-not $pwd) { $pwd = $env:RDP_PASSWORD_INPUT }
-          if (-not $pwd) { $pwd = "P@ssw0rd!" }
-          "RDP_PASSWORD=$pwd" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ([string]::IsNullOrWhiteSpace($pwd)) { $pwd = $env:RDP_PASSWORD_INPUT }
+          if ([string]::IsNullOrWhiteSpace($pwd)) { $pwd = "P@ssw0rd!" }
+          "RDP_PASSWORD=$pwd" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-      - name: Download and extract ngrok
+      - name: Download and extract ngrok (robust)
         shell: pwsh
         run: |
           Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+          # Try extracting to current folder
           Expand-Archive ngrok.zip -DestinationPath . -Force
-          .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
+          $ng = Join-Path $PWD "ngrok\ngrok.exe"
+          if (-not (Test-Path $ng)) { $ng = Join-Path $PWD "ngrok.exe" }
+          if (-not (Test-Path $ng)) {
+            # Fallback: extract into .\ngrok\ explicitly
+            if (Test-Path ".\ngrok") { Remove-Item -Recurse -Force ".\ngrok" }
+            New-Item -ItemType Directory -Path ".\ngrok" | Out-Null
+            Expand-Archive ngrok.zip -DestinationPath ".\ngrok" -Force
+            $ng = Join-Path $PWD "ngrok\ngrok.exe"
+          }
+          if (-not (Test-Path $ng)) { throw "ngrok.exe not found after extract" }
+          Write-Host "ngrok at: $ng"
+          # Authenticate
+          & $ng authtoken $Env:NGROK_AUTH_TOKEN
 
       - name: Enable Remote Desktop
         shell: pwsh
@@ -62,12 +88,14 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Write-Host "RDP enabled and firewall rule applied."
 
       - name: Set runneradmin password
         shell: pwsh
         run: |
           $pwd = '${{ steps.rdp_pass.outputs.RDP_PASSWORD }}'
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pwd -Force)
+          Write-Host "runneradmin password set."
 
       - name: Prepare Bot base directory
         shell: pwsh
@@ -76,6 +104,7 @@ jobs:
           $BOT_BASE = Join-Path $downloads "Bot"
           New-Item -ItemType Directory -Force -Path $downloads | Out-Null
           New-Item -ItemType Directory -Force -Path $BOT_BASE | Out-Null
+          Write-Host "Created $BOT_BASE"
 
       - name: Download and extract Bot to C:\Users\runneradmin\Downloads\Bot
         shell: pwsh
@@ -92,6 +121,7 @@ jobs:
 
           try {
             $zipPath = Join-Path $tmp 'bot.zip'
+            Write-Host ("Downloading Bot.zip from {0} ..." -f $env:BOT_ZIP_URL)
             Invoke-WebRequest -Uri $env:BOT_ZIP_URL -OutFile $zipPath -UseBasicParsing
 
             $extract = Join-Path $tmp 'unzipped'
@@ -104,11 +134,19 @@ jobs:
 
             if ($candidates.Count -gt 0) {
               $root = $candidates[0]
+              Write-Host ("Found root folder in archive: {0}" -f $root)
               Copy-Item -Path (Join-Path $root '*') -Destination $BOT_BASE -Recurse -Force
             } else {
+              Write-Host "No root 'Bot' folder; copying all extracted files into BOT_BASE"
               Copy-Item -Path (Join-Path $extract '*') -Destination $BOT_BASE -Recurse -Force
             }
-          } finally {
+
+            Write-Host "Downloads directory listing:"
+            Get-ChildItem -Force $downloads | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+            Write-Host "Bot directory listing:"
+            Get-ChildItem -Force $BOT_BASE | Select-Object Name,Length,LastWriteTime | Format-Table -AutoSize
+          }
+          finally {
             try { Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue } catch {}
           }
 
@@ -117,7 +155,11 @@ jobs:
         run: |
           $BOT_BASE = "C:\Users\runneradmin\Downloads\Bot"
           $bat = Join-Path $BOT_BASE 'start-bots.bat'
-          if (-not (Test-Path $bat)) { throw "start-bots.bat not found at $bat" }
+          if (-not (Test-Path $bat)) {
+            Write-Error ("start-bots.bat not found at {0}" -f $bat)
+            exit 1
+          }
+          Write-Host "Launching bots via start-bots.bat in background ..."
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = $bat
           $psi.WorkingDirectory = $BOT_BASE
@@ -130,25 +172,33 @@ jobs:
         env:
           HOLD_MINUTES: ${{ env.HOLD_MINUTES }}
         run: |
+          # Resolve ngrok path (supports both .\ngrok.exe and .\ngrok\ngrok.exe)
+          $ngrok = Join-Path $PWD "ngrok\ngrok.exe"
+          if (-not (Test-Path $ngrok)) { $ngrok = Join-Path $PWD "ngrok.exe" }
+          if (-not (Test-Path $ngrok)) { throw "ngrok.exe not found" }
+
+          # Determine hold duration
           $minutes = 180
           if ($env:HOLD_MINUTES -and ($env:HOLD_MINUTES -as [int]) -gt 0) {
             $minutes = [int]$env:HOLD_MINUTES
           }
           $deadline = (Get-Date).AddMinutes($minutes)
 
-          function Start-NgrokLoop {
-            $ngrokPath = Join-Path $PWD "ngrok\ngrok.exe"
-            while ((Get-Date) -lt $deadline) {
-              try {
-                & $ngrokPath tcp 3389 --log=stdout
-              } catch {
-                Write-Host ("ngrok error: {0}" -f $_.Exception.Message)
-              }
-              Start-Sleep -Seconds 2
+          Write-Host "Starting resilient ngrok loop for ~ $minutes minutes."
+          while ((Get-Date) -lt $deadline) {
+            $startTime = Get-Date
+            Write-Host ("[{0}] ngrok starting tcp 3389 ..." -f $startTime.ToString("HH:mm:ss"))
+            try {
+              & $ngrok tcp 3389 --log=stdout
+            } catch {
+              Write-Host ("ngrok error: {0}" -f $_.Exception.Message)
             }
+            $endTime = Get-Date
+            $dur = [int]($endTime - $startTime).TotalSeconds
+            Write-Host ("[{0}] ngrok exited after {1}s. Restarting in 2s..." -f $endTime.ToString("HH:mm:ss"), $dur)
+            Start-Sleep -Seconds 2
           }
-
-          Start-NgrokLoop
+          Write-Host "Resilient loop window elapsed."
 
       - name: Final status
         if: always()
