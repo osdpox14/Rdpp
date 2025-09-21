@@ -109,66 +109,85 @@ jobs:
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pwd -Force)
           Write-Host "runneradmin password set."
 
-      - name: Install Google Chrome (winget with Chocolatey fallback)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          function Test-Chrome { Test-Path "C:\Program Files\Google\Chrome\Application\chrome.exe" -or Test-Path "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
-
-          if (-not (Test-Chrome)) {
-            Write-Host "Trying winget to install Google Chrome..."
-            try {
-              winget install Google.Chrome --silent --accept-source-agreements --accept-package-agreements --disable-interactivity
-            } catch {
-              Write-Host "winget failed or not available. Trying Chocolatey..."
-              choco install googlechrome -y --no-progress
-            }
-          } else {
-            Write-Host "Chrome already present."
-          }
-
-          # Verify installation
-          if (-not (Test-Chrome)) { throw "Google Chrome installation failed." }
-          Write-Host "Google Chrome is installed."
-
-      - name: Initialize Chrome profile (Default) and suppress first-run
+      - name: Ensure Chrome is present (check only)
         shell: pwsh
         run: |
           $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
           if (-not (Test-Path $chrome)) { $chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
-          if (-not (Test-Path $chrome)) { throw "chrome.exe not found after install" }
+          if (-not (Test-Path $chrome)) {
+            throw "Chrome not found. Please switch back to the installer step or ensure Chrome exists at standard paths."
+          }
+          Write-Host "Chrome found at: $chrome"
 
-          # Create policies to suppress first-run prompts and default browser checks
+      - name: Create Chrome Default profile and suppress first-run
+        shell: pwsh
+        run: |
+          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          if (-not (Test-Path $chrome)) { $chrome = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe" }
+
+          # Create policies to suppress first-run/default-browser prompts
           New-Item -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Force | Out-Null
           New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "SuppressFirstRunDefaultBrowserPrompt" -PropertyType DWord -Value 1 -Force | Out-Null
           New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "DefaultBrowserSettingEnabled" -PropertyType DWord -Value 0 -Force | Out-Null
           New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Google\Chrome" -Name "BrowserSignin" -PropertyType DWord -Value 0 -Force | Out-Null
 
-          # Pre-create user data and Default profile
+          # Pre-create user data directories
           $userData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
           $defaultProfile = Join-Path $userData "Default"
           New-Item -ItemType Directory -Force -Path $defaultProfile | Out-Null
 
-          # Launch Chrome headless once to materialize the profile and then close
+          # Seed minimal Preferences and Local State to mark clean exit and disable first run
+          $prefsPath = Join-Path $defaultProfile "Preferences"
+          if (-not (Test-Path $prefsPath)) {
+            $prefs = @{
+              "browser" = @{
+                "has_seen_welcome_page" = true
+              }
+              "first_run_tabs" = @()
+              "distribution" = @{
+                "skip_first_run_ui" = true
+              }
+              "profile" = @{
+                "exit_type" = "Normal"
+                "name" = "Default"
+              }
+            } | ConvertTo-Json -Depth 5
+            $prefs | Out-File -FilePath $prefsPath -Encoding utf8 -Force
+          }
+
+          $localStatePath = Join-Path $userData "Local State"
+          if (-not (Test-Path $localStatePath)) {
+            $localState = @{
+              "browser" = @{
+                "enabled_labs_experiments" = @()
+              }
+              "profile" = @{
+                "last_used" = "Default"
+              }
+            } | ConvertTo-Json -Depth 5
+            $localState | Out-File -FilePath $localStatePath -Encoding utf8 -Force
+          }
+
+          # Prime the profile silently in headless mode
           $args = @(
             "--headless=new",
             "--disable-gpu",
             "--no-first-run",
             "--no-default-browser-check",
             "--user-data-dir=""$userData""",
-            "--profile-directory=""Default""",
-            "--disable-features=NetworkService,TranslateUI"
+            "--profile-directory=""Default"""
           ) -join " "
 
-          Write-Host "Priming Chrome profile at $defaultProfile"
+          Write-Host "Priming Chrome profile at: $defaultProfile"
           Start-Process -FilePath $chrome -ArgumentList $args
           Start-Sleep -Seconds 6
           Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-          if (-not (Test-Path (Join-Path $defaultProfile "Preferences"))) {
-            Write-Host "Preferences file not yet present; this is OK, profile folder exists."
+          if (Test-Path $prefsPath) {
+            Write-Host "Chrome profile initialized with Preferences."
+          } else {
+            Write-Host "Chrome profile folder exists; Preferences file may be created at first real run."
           }
-          Write-Host "Chrome profile initialized."
 
       - name: Prepare Bot base directory
         shell: pwsh
