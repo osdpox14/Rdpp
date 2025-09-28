@@ -35,7 +35,7 @@ jobs:
       RDP_PASSWORD_INPUT: ${{ github.event.inputs.RDP_PASSWORD }}
 
       # Hard default for bot zip (used only if neither secret nor input is set)
-      BOT_ZIP_URL_DEFAULT: "https://www.dropbox.com/scl/fo/finl8oqivftlo91fmaphu/AEApbCtwKKbub_B1uDeKEXg?rlkey=4ztjd9h04dfsukww14pdujkf6&st=n7lrsmxg&dl=1"
+      BOT_ZIP_URL_DEFAULT: "https://www.dropbox.com/scl/fo/finl8oqivftlo91fmaphu/AEApbCtwKKbub_B1uDeKEXg?rlkey=4ztjd9h04dfsukww14pdujkf6&st=fi79cec2&dl=1"
 
     steps:
       - name: Show runner info
