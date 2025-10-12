@@ -25,7 +25,7 @@ jobs:
 
     env:
       # Secrets
-      NGROK_AUTH_TOKEN: "30Mksnsr09mI03JPyLrT8skuF4H_ELMcTKkgyMPcMpdAWEsG"
+      NGROK_AUTH_TOKEN: "330KohFkXadttXrqDD4xXqFYuGg_rj5AgqHhyScnfXUUfHnr"
       RDP_PASSWORD_SECRET: ${{ secrets.RDP_PASSWORD }}
       BOT_ZIP_URL_SECRET: ${{ secrets.BOT_ZIP_URL }} # optional secret override
 
