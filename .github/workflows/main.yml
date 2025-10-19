@@ -9,7 +9,7 @@ on:
       HOLD_MINUTES:
         description: "How long to keep the session alive (minutes)"
         required: false
-        default: "180"
+        default: "360"
       BOT_ZIP_URL:
         description: "Direct link to your Bot.zip (Downloads\\Bot target)"
         required: false
@@ -58,7 +58,7 @@ jobs:
           # Hold minutes
           $hold = $env:HOLD_MINUTES_INPUT
           if ([string]::IsNullOrWhiteSpace($hold)) { $hold = "180" }
-          if (-not ($hold -as [int])) { $hold = "180" }
+          if (-not ($hold -as [int])) { $hold = "360" }
 
           # RDP password: secret > input > default
           $rdp = $env:RDP_PASSWORD_SECRET
@@ -278,7 +278,7 @@ jobs:
           if (-not (Test-Path $ngrok)) { throw "ngrok.exe not found" }
 
           # Determine hold duration
-          $minutes = 180
+          $minutes = 360
           if ($env:HOLD_MINUTES -and ($env:HOLD_MINUTES -as [int]) -gt 0) { $minutes = [int]$env:HOLD_MINUTES }
           $deadline = (Get-Date).AddMinutes($minutes)
 
